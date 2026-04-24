@@ -34,6 +34,3 @@ dist-ssr
 
 src/server/database/cccliai.sqlite
 
-# Gateway configurations (contain sensitive credentials)
-gateways/
-cccliai
