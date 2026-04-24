@@ -1,0 +1,413 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/cccliai/app/internal/config"
+	"github.com/cccliai/app/internal/logger"
+)
+
+type Provider interface {
+	ChatCompletion(ctx context.Context, msgs []Message) (*Response, error)
+}
+
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type Response struct {
+	Content      string `json:"content"`
+	InputTokens  int    `json:"input_tokens"`
+	OutputTokens int    `json:"output_tokens"`
+}
+
+type CognitionLoop struct {
+	Provider   Provider
+	MaxSteps   int
+	Config     *config.Config
+	OnTool     func(toolName string, category string, args map[string]interface{})
+	OnResponse func(content string)
+	OnStats    func(totalInput, totalOutput int)
+}
+
+func NewCognitionLoop(p Provider, maxSteps int, cfg *config.Config) *CognitionLoop {
+	return &CognitionLoop{
+		Provider: p,
+		MaxSteps: maxSteps,
+		Config:   cfg,
+	}
+}
+
+const baseSystemPrompt = `You are an autonomous, production-grade AI Software Engineer operating inside a controlled execution runtime.
+
+Your role is to PLAN, VALIDATE, and EXECUTE tasks using available tools with high precision and minimal resource usage.
+
+---
+
+## SYSTEM CONTRACT
+
+You operate in discrete cycles:
+
+1. PLAN → decide what to do
+2. VALIDATE → ensure actions are safe and necessary
+3. EXECUTE → call tools (if needed)
+4. COMPLETE → return final answer when no further actions are required
+
+---
+
+## AVAILABLE TOOLS
+
+{tool_list_repr}
+
+---
+
+## OUTPUT FORMAT (STRICT)
+
+You MUST follow one of these two modes:
+
+### 1. TOOL EXECUTION MODE
+
+If any action is required, output ONLY tool calls:
+
+tool: TOOL_NAME({"arg": "value"})
+tool: SKILL_NAME({})
+
+Rules:
+- One tool per line
+- ALWAYS start with "tool:" prefix
+- ALWAYS include parentheses with JSON args (use {} if no args)
+- No explanations, no extra text
+- Multiple tools = executed in PARALLEL
+- Only call tools that are necessary
+
+---
+
+### 2. FINAL RESPONSE MODE
+
+If the task is complete and NO tools are needed:
+
+- Output ONLY the final answer
+- No tool lines
+- No planning text
+
+---
+
+## EXECUTION RULES
+
+1. MINIMIZE OPERATIONS
+   - Do not call tools unless required
+   - Avoid redundant reads or repeated actions
+
+2. NO BULK SCANS
+   - NEVER scan entire directories blindly
+   - ALWAYS prefer "search_files" before accessing files
+
+3. TARGETED FILE ACCESS
+   - Use "read_file_chunked" instead of full reads
+   - Only access relevant sections
+
+4. CONTROLLED SHELL USAGE
+   - "exec" is a fallback tool, not primary
+   - Avoid chaining shell commands unnecessarily
+
+5. GIT TOOL RESTRICTION
+   - DO NOT use git tools unless explicitly requested
+
+---
+
+## CONTEXT-AWARE SHORT-CIRCUIT
+
+The system may preload high-level context (e.g. README.md, REFACTORING_NOTES.md).
+
+If the user asks:
+- “what is this project?”
+- “explain the codebase”
+- or similar high-level questions
+
+THEN:
+- DO NOT call any tools
+- Answer immediately using provided context
+
+---
+
+## SAFETY & VALIDATION
+
+Before executing tools, ensure:
+
+- The action directly contributes to the task
+- The scope is minimal and precise
+- The command is safe and non-destructive
+
+NEVER:
+- execute destructive commands blindly
+- modify unknown files without reading context first
+
+---
+
+## DECISION HEURISTICS
+
+Prefer:
+
+- search → read → edit → validate
+
+- fetch_url → Use this for standard websites. NEVER use this for MCP server URLs (e.g. mcp.exa.ai).
+- mcp_call → Use this for all MCP servers listed in the CONFIGURED MCP SERVERS section.
+
+Avoid:
+
+- read → read → read (without narrowing scope)
+- exec for simple file operations
+- large context expansion
+
+---
+
+## IDENTITY
+
+{persona_text}
+
+---
+
+## FINAL DIRECTIVE
+
+Be precise, efficient, and deterministic.
+
+Do not over-explore.
+Do not over-execute.
+Stop immediately when the task is complete.
+`
+
+// (Tools are now extracted into tools.go)
+
+func (c *CognitionLoop) Run(ctx context.Context, initialQuery string) (string, error) {
+	logger.Info("Agent", "🧠 Cognition Loop started")
+
+	personaText, activeToolNames, excludeCmds := c.loadPersonaConfig()
+
+	cwd, _ := os.Getwd()
+	homeDir, _ := os.UserHomeDir()
+	if homeDir == "" {
+		homeDir = "."
+	}
+	skillsJsonPath := filepath.Join(homeDir, ".cccliai", "skills", "skills.json")
+	if content, err := os.ReadFile(skillsJsonPath); err == nil {
+		var config SkillConfig
+		if err := json.Unmarshal(content, &config); err == nil {
+			for _, skill := range config.Skills {
+				if skill.Installed {
+					activeToolNames = append(activeToolNames, skill.ID)
+				}
+			}
+		}
+	}
+
+	reg := GetToolRegistry(c.Config, excludeCmds, cwd)
+
+	effectiveBasePrompt := baseSystemPrompt
+
+	// Inject Markdown Skills (System Instructions)
+	if entries, err := os.ReadDir(filepath.Join(homeDir, ".cccliai", "skills")); err == nil {
+		mdSkills := "\nAVAILABLE SPECIALIZED SKILLS (Call the tool to load full guidelines):\n"
+		hasMd := false
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".md") {
+				if content, err := os.ReadFile(filepath.Join(homeDir, ".cccliai", "skills", e.Name())); err == nil {
+					parts := strings.SplitN(string(content), "---", 3)
+					skillName := e.Name()
+					skillDesc := "Expert guidelines and principles."
+					if len(parts) >= 3 {
+						// Extract name and description from frontmatter
+						for _, line := range strings.Split(parts[1], "\n") {
+							line = strings.TrimSpace(line)
+							if strings.HasPrefix(line, "name:") {
+								skillName = strings.TrimSpace(line[5:])
+							} else if strings.HasPrefix(line, "description:") {
+								skillDesc = strings.TrimSpace(line[12:])
+							}
+						}
+					}
+					mdSkills += fmt.Sprintf("- %s: %s\n", skillName, skillDesc)
+					activeToolNames = append(activeToolNames, skillName)
+					hasMd = true
+				}
+			}
+		}
+		if hasMd {
+			effectiveBasePrompt += "\n" + mdSkills
+		}
+	}
+
+	repStr := ""
+	for _, tName := range activeToolNames {
+		tName = strings.TrimSpace(tName)
+		if tool, ok := reg[tName]; ok {
+			repStr += "TOOL\n===\n"
+			repStr += fmt.Sprintf("Name: %s\nDescription: %s\nSignature: %s\n\n", tool.Name, tool.Description, tool.Signature)
+		}
+	}
+	sysPrompt := strings.Replace(effectiveBasePrompt, "{tool_list_repr}", repStr, 1)
+	sysPrompt = strings.Replace(sysPrompt, "{persona_text}", personaText, 1)
+
+	// Inject structural workspace context dynamically (INTERNAL PRE-READ)
+	extContext := ""
+	for _, fn := range []string{"README.md", "cccliai.md", "Agent.md"} {
+		if content, err := os.ReadFile(filepath.Join(cwd, fn)); err == nil {
+			str := string(content)
+			if len(str) > 1500 {
+				str = str[:1500] + "\n...(truncated)"
+			}
+			extContext += fmt.Sprintf("\n--- Context %s ---\n%s\n", fn, str)
+		}
+	}
+
+	if extContext != "" {
+		sysPrompt += "\nWORKSPACE CONTEXT AUTO-LOADED (Internal Read):\n" + extContext
+	} else {
+		sysPrompt += "\nWORKSPACE CONTEXT AUTO-LOADED: None found natively. You must manually utilize 'list_files' or 'search_files' to map context if needed."
+	}
+
+	if c.Config != nil && len(c.Config.MCPServers) > 0 {
+		mcpDesc := "\nCONFIGURED MCP SERVERS (Use 'mcp_call' to invoke tools from these servers):\n"
+		for name, srv := range c.Config.MCPServers {
+			if srv.Disabled {
+				continue
+			}
+			if srv.ServerURL != "" {
+				mcpDesc += fmt.Sprintf("- %s: (SSE) %s\n", name, srv.ServerURL)
+			} else {
+				mcpDesc += fmt.Sprintf("- %s: (Stdio) %s %v\n", name, srv.Command, srv.Args)
+			}
+		}
+		sysPrompt += mcpDesc
+	}
+
+	messages := []Message{{Role: "system", Content: sysPrompt}, {Role: "user", Content: initialQuery}}
+
+	// Spin up a 5-thread worker pool natively executing sandboxed ops
+	engine := NewExecutionEngine(5, reg)
+
+	totalInput := 0
+	totalOutput := 0
+
+	for i := 0; i < c.MaxSteps; i++ {
+		// Optimize limits before inference (Sliding window / Chunking enforcement)
+		messages = OptimizeContext(messages, 20000)
+
+		response, err := c.Provider.ChatCompletion(ctx, messages)
+		if err != nil {
+			return "", fmt.Errorf("provider err: %v", err)
+		}
+
+		totalInput += response.InputTokens
+		totalOutput += response.OutputTokens
+		if c.OnStats != nil {
+			c.OnStats(totalInput, totalOutput)
+		}
+
+		truncated := response.Content
+		if len(truncated) > 100 {
+			truncated = truncated[:100] + "..."
+		}
+		logger.Info("Agent", fmt.Sprintf("🤖 Response: %s", strings.ReplaceAll(truncated, "\n", " ")))
+
+		messages = append(messages, Message{Role: "assistant", Content: response.Content})
+
+		if c.OnResponse != nil {
+			c.OnResponse(response.Content)
+		}
+
+		// 1. Planning Layer parses parallel commands
+		reqs := ParseActionPlan(response.Content)
+		if len(reqs) > 0 {
+			for _, req := range reqs {
+				cat := "Ran"
+				if t, ok := reg[req.Name]; ok {
+					cat = t.Category
+				}
+				if c.OnTool != nil {
+					c.OnTool(req.Name, cat, req.Args)
+				}
+				logger.Info("Agent", fmt.Sprintf("⚙️ Scheduling %s args: %v", req.Name, req.Args))
+			}
+
+			// 2. Scheduler invokes parallel go-routines execution natively
+			results := engine.ExecuteParallel(ctx, reqs)
+
+			// 3. State Sync / Re-feed
+			for _, res := range results {
+				messages = append(messages, Message{Role: "user", Content: fmt.Sprintf("tool_result(%s):\n%s", res.Name, res.Output)})
+			}
+			continue
+		}
+
+		logger.Info("Agent", "✅ Cognition Loop completed")
+		return response.Content, nil
+	}
+	return "I hit my maximum reasoning steps limits.", nil
+}
+
+func (c *CognitionLoop) loadPersonaConfig() (string, []string, []string) {
+	homeDir, _ := os.UserHomeDir()
+	if homeDir == "" {
+		homeDir = "."
+	}
+
+	defaultTools := []string{
+		"exec", "read_file", "list_files", "search_files",
+		"apply_patch", "replace_range",
+		"git_status", "git_diff", "git_apply_patch",
+		"run_tests", "validate_syntax", "fetch_url", "mcp_call",
+	}
+	defaultPersona := "# Agent Identity\n\n**Name:** cccliai\n\nYou are an autonomous, careful coding assistant."
+	personaPath := filepath.Join(homeDir, ".cccliai", "Persona.md")
+
+	content, err := os.ReadFile(personaPath)
+	if err != nil {
+		_ = os.MkdirAll(filepath.Dir(personaPath), 0755)
+		seed := defaultPersona + "\n\ntools: " + strings.Join(defaultTools, ", ") + "\nexclude_cmd: "
+		_ = os.WriteFile(personaPath, []byte(seed), 0644)
+		return defaultPersona, defaultTools, nil
+	}
+
+	personaTxt := string(content)
+	// Base required semantic tools expanded to encompass the entire Production 15-system scale
+	tools := defaultTools
+	excludes := []string{}
+
+	lines := strings.Split(personaTxt, "\n")
+	var cleaned []string
+	for _, l := range lines {
+		line := strings.TrimSpace(l)
+		if strings.HasPrefix(line, "tools:") {
+			if parsed := parseCommaSeparated(strings.TrimSpace(line[6:])); len(parsed) > 0 {
+				tools = parsed
+			}
+		} else if strings.HasPrefix(line, "exclude_cmd:") {
+			excludes = parseCommaSeparated(strings.TrimSpace(line[12:]))
+		} else {
+			cleaned = append(cleaned, l)
+		}
+	}
+	return strings.Join(cleaned, "\n"), tools, excludes
+}
+
+func parseCommaSeparated(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		v := strings.TrimSpace(p)
+		if v != "" {
+			result = append(result, v)
+		}
+	}
+	return result
+}
